@@ -25,6 +25,8 @@ type VM struct {
 	Arch      string   `json:"arch,omitempty"`      // qemu architecture, e.g. "x86_64"
 	CPUs      int      `json:"cpus,omitempty"`      // -smp count (0 == qemu default)
 	Display   string   `json:"display,omitempty"`   // qemu -display type; "" == windowed default, "none" == headless
+	Spice     bool     `json:"spice,omitempty"`     // enable SPICE agent/clipboard channel
+	SpicePort int      `json:"spicePort,omitempty"` // host SPICE TCP port when Spice is enabled
 	ISO       string   `json:"iso,omitempty"`       // default install/boot ISO (absolute path)
 	ExtraArgs []string `json:"extraArgs,omitempty"` // default extra args passed verbatim to qemu
 	SSHPort   int      `json:"sshPort"`             // host port forwarded to guest :22
@@ -58,6 +60,21 @@ func (c *Config) nextSSHPort(basePort int) int {
 	used := map[int]bool{}
 	for _, vm := range c.VMs {
 		used[vm.SSHPort] = true
+	}
+	for p := basePort; ; p++ {
+		if !used[p] {
+			return p
+		}
+	}
+}
+
+// nextSPICEPort returns the smallest port >= basePort used by no SPICE-enabled VM.
+func (c *Config) nextSPICEPort(basePort int) int {
+	used := map[int]bool{}
+	for _, vm := range c.VMs {
+		if vm.Spice && vm.SpicePort > 0 {
+			used[vm.SpicePort] = true
+		}
 	}
 	for p := basePort; ; p++ {
 		if !used[p] {

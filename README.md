@@ -86,15 +86,22 @@ qmain unfreeze-disk <name>                          # refuses if clones depend o
 qmain delete-disk   <name>                          # refuses if VMs or clones depend on it; asks confirmation
 
 # VMs
-qmain create-vm <name> [--disk <name>] [--ram <8G>] [--cpu <x86_64>] [--cpus <n>] [--display <type>] [--iso <file>] [-- <extra qemu args>]
-qmain set-vm    <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--iso <file>] [--no-iso] [-- <extra qemu args>]
+qmain create-vm <name> [--disk <name>] [--ram <8G>] [--cpu <x86_64>] [--cpus <n>] [--display <type>] [--spice] [--iso <file>] [-- <extra qemu args>]
+qmain set-vm    <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--spice|--no-spice] [--iso <file>] [--no-iso] [-- <extra qemu args>]
 qmain run       <name> [--iso <file>] [--display <type>] [--cpus <n>] [-- <extra qemu args>]   # flags override stored params
 qmain kill      <name>                              # verifies pid is qemu first, then SIGKILL
 qmain clear     <name>                              # clears stale pid if the process is dead
 qmain get-ssh   <name>                              # prints "ssh -p <port> root@127.0.0.1"
+qmain get-spice <name>                              # prints "remote-viewer spice://127.0.0.1:<port>"
 qmain delete    <name>                              # asks confirmation, kills if running, removes config
 qmain list                                          # list VMs
 qmain list-disks                                    # list disks
+
+# Aliases
+qmain rm <name>                                     # alias for delete
+qmain ls                                            # alias for list
+qmain rmd <name>                                    # alias for delete-disk
+qmain lsd                                           # alias for list-disks
 ```
 
 Global flags (placed **before** the command):
@@ -113,6 +120,7 @@ or later via `set-vm`), so day-to-day use is just `qmain run <vm>`:
 |-------------|---------------------|--------------------------------------------------------|
 | CPUs        | `--cpus <n>`        | `-smp <n>` (omitted when unset)                        |
 | Display     | `--display <type>`  | `-display <type>`; unset = a normal **UI window**, `none` = headless |
+| SPICE       | `--spice`           | enables SPICE/vdagent channel (clipboard etc.) and tracks an allocated `spicePort` |
 | ISO         | `--iso <file>`      | `-cdrom <file> -boot order=dc`                         |
 | Extra args  | `-- <args...>`      | appended verbatim to `qemu-system-*`                   |
 
@@ -134,6 +142,21 @@ track the running VM.
 > **Display note:** a fresh VM opens qemu's default graphical window. A windowed
 > display needs a desktop session (a valid `DISPLAY`/Wayland); on a headless host
 > use `--display none` and reach the guest over the forwarded SSH port.
+
+> **Acceleration:** on x86 hosts VMs run with KVM by default
+> (`-machine accel=kvm:tcg`). When `/dev/kvm` is unavailable qemu falls back to
+> software emulation automatically, so VMs still start everywhere. Other arches
+> use qemu's default accelerator.
+
+## Deleting a disk
+
+`delete-disk` asks **two** questions so you don't lose data by accident:
+
+1. *Remove disk `<name>` from qmain?* — drops it from qmain's config.
+2. *Also delete the image file `<path>`?* — answer **no** to keep the `.qcow2`
+   file on disk and only detach it from qmain; answer **yes** to also `rm` it.
+
+It still refuses outright while a VM or a clone depends on the disk.
 
 ## Clone safety
 

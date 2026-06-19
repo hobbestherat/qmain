@@ -12,6 +12,7 @@ import (
 // --- create-vm ---
 
 const baseSSHPort = 2222
+const baseSPICEPort = 5930
 
 // CreateVMOptions holds optional parameters for create-vm. These are persisted
 // on the VM so that `run` can be invoked with no flags.
@@ -21,6 +22,7 @@ type CreateVMOptions struct {
 	Arch    string   // override default x86_64
 	CPUs    int      // -smp count (0 == qemu default)
 	Display string   // qemu -display type ("" == windowed default, "none" == headless)
+	Spice   bool     // enable SPICE + guest agent channel (clipboard, etc.)
 	ISO     string   // default ISO to boot/install from (absolute path)
 	Extra   []string // default extra args passed verbatim to qemu
 }
@@ -60,6 +62,10 @@ func CreateVM(r Runner, c *Config, name string, opts CreateVMOptions) (*VM, erro
 		return nil, fmt.Errorf("cpus must be >= 0, got %d", opts.CPUs)
 	}
 	port := c.nextSSHPort(baseSSHPort)
+	spicePort := 0
+	if opts.Spice {
+		spicePort = c.nextSPICEPort(baseSPICEPort)
+	}
 
 	vm := &VM{
 		Name:      name,
@@ -68,6 +74,8 @@ func CreateVM(r Runner, c *Config, name string, opts CreateVMOptions) (*VM, erro
 		Arch:      arch,
 		CPUs:      opts.CPUs,
 		Display:   opts.Display,
+		Spice:     opts.Spice,
+		SpicePort: spicePort,
 		ISO:       opts.ISO,
 		ExtraArgs: opts.Extra,
 		SSHPort:   port,
@@ -88,6 +96,7 @@ type VMUpdate struct {
 	Arch    *string
 	CPUs    *int
 	Display *string
+	Spice   *bool
 	ISO     *string
 	Extra   *[]string
 }
@@ -95,7 +104,7 @@ type VMUpdate struct {
 // IsEmpty reports whether the update would change nothing.
 func (u VMUpdate) IsEmpty() bool {
 	return u.Disk == nil && u.RAM == nil && u.Arch == nil && u.CPUs == nil &&
-		u.Display == nil && u.ISO == nil && u.Extra == nil
+		u.Display == nil && u.Spice == nil && u.ISO == nil && u.Extra == nil
 }
 
 // SetVM applies a partial update to an existing VM, validating any referenced
@@ -136,6 +145,17 @@ func SetVM(c *Config, name string, u VMUpdate) (*VM, error) {
 	if u.Display != nil {
 		vm.Display = *u.Display
 	}
+	if u.Spice != nil {
+		if *u.Spice {
+			if !vm.Spice || vm.SpicePort == 0 {
+				vm.SpicePort = c.nextSPICEPort(baseSPICEPort)
+			}
+			vm.Spice = true
+		} else {
+			vm.Spice = false
+			vm.SpicePort = 0
+		}
+	}
 	if u.ISO != nil {
 		vm.ISO = *u.ISO
 	}
@@ -150,11 +170,26 @@ func SetVM(c *Config, name string, u VMUpdate) (*VM, error) {
 // RunOptions holds per-run parameters. Any field left at its zero value falls
 // back to the value persisted on the VM (see mergeRunOptions).
 type RunOptions struct {
-	ISO     string   // install/live ISO to boot from
-	Display string   // qemu -display type override
-	CPUs    int      // -smp override
-	Extra   []string // extra args appended verbatim to qemu (after "--")
-	PidFile string   // where qemu should write its pid (set by RunVM)
+	ISO       string   // install/live ISO to boot from
+	Display   string   // qemu -display type override
+	CPUs      int      // -smp override
+	Spice     bool     // enable SPICE channel for this run
+	SpicePort int      // SPICE TCP port when Spice is enabled
+	Accel     string   // qemu -machine accel value (e.g. "kvm:tcg"); set from arch
+	Extra     []string // extra args appended verbatim to qemu (after "--")
+	PidFile   string   // where qemu should write its pid (set by RunVM)
+}
+
+// defaultAccel returns the qemu accelerator list for an arch. On x86 we prefer
+// hardware KVM for performance but fall back to software emulation (tcg) so VMs
+// still start on hosts without /dev/kvm. Other arches use qemu's default.
+func defaultAccel(arch string) string {
+	switch arch {
+	case "x86_64", "i386", "x86":
+		return "kvm:tcg"
+	default:
+		return ""
+	}
 }
 
 // mergeRunOptions resolves the effective run parameters by layering the per-run
@@ -162,9 +197,12 @@ type RunOptions struct {
 // appended after the VM's stored extra args.
 func mergeRunOptions(vm *VM, o RunOptions) RunOptions {
 	eff := RunOptions{
-		ISO:     vm.ISO,
-		Display: vm.Display,
-		CPUs:    vm.CPUs,
+		ISO:       vm.ISO,
+		Display:   vm.Display,
+		CPUs:      vm.CPUs,
+		Spice:     vm.Spice,
+		SpicePort: vm.SpicePort,
+		Accel:     defaultAccel(vm.Arch),
 	}
 	eff.Extra = append(eff.Extra, vm.ExtraArgs...)
 	if o.ISO != "" {
@@ -195,8 +233,21 @@ func qemuArgs(diskPath, ram string, hostFwdPort int, opts RunOptions) []string {
 		"-netdev", "user,id=net0,hostfwd=tcp::" + strconv.Itoa(hostFwdPort) + "-:22",
 		"-device", "virtio-net-pci,netdev=net0",
 	}
+	// Hardware acceleration (KVM on x86) with graceful fallback to emulation.
+	if opts.Accel != "" {
+		args = append(args, "-machine", "accel="+opts.Accel)
+	}
 	if opts.CPUs > 0 {
 		args = append(args, "-smp", strconv.Itoa(opts.CPUs))
+	}
+	if opts.Spice && opts.SpicePort > 0 {
+		// SPICE + vdagent channel enables clipboard sharing and other guest-agent features.
+		args = append(args,
+			"-spice", "port="+strconv.Itoa(opts.SpicePort)+",disable-ticketing=on,agent-mouse=on",
+			"-device", "virtio-serial-pci",
+			"-chardev", "spicevmc,id=vdagent,name=vdagent",
+			"-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
+		)
 	}
 	// Display: an empty type lets qemu open its default graphical window (UI);
 	// "none" runs headless. Only emit -display when a type is set so the default
@@ -240,6 +291,9 @@ func RunVM(r Runner, c *Config, name string, opts RunOptions) (string, int, erro
 	}
 	if d.Frozen {
 		return "", 0, fmt.Errorf("disk %q is frozen; cannot run vm %q", vm.Disk, name)
+	}
+	if vm.Spice && vm.SpicePort == 0 {
+		vm.SpicePort = c.nextSPICEPort(baseSPICEPort)
 	}
 
 	opts = mergeRunOptions(vm, opts)
@@ -366,6 +420,18 @@ func GetSSH(c *Config, name string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("ssh -p %d root@127.0.0.1", vm.SSHPort), nil
+}
+
+// GetSpice returns the remote-viewer command string for a SPICE-enabled VM.
+func GetSpice(c *Config, name string) (string, error) {
+	vm, err := getVM(c, name)
+	if err != nil {
+		return "", err
+	}
+	if !vm.Spice || vm.SpicePort <= 0 {
+		return "", fmt.Errorf("vm %q does not have SPICE enabled", name)
+	}
+	return fmt.Sprintf("remote-viewer spice://127.0.0.1:%d", vm.SpicePort), nil
 }
 
 // --- helpers ---

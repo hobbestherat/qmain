@@ -282,6 +282,61 @@ func TestCLICreateVMExplicitDisk(t *testing.T) {
 	}
 }
 
+func TestCLICreateVMSpice(t *testing.T) {
+	bin := buildBinary(t)
+	workdir := t.TempDir()
+	cfg := filepath.Join(workdir, "config.json")
+	runCLI(t, bin, cfg, workdir, "create-disk", "d", "5G")
+	out, stderr, code := runCLI(t, bin, cfg, workdir, "create-vm", "v1", "--disk", "d", "--spice")
+	if code != 0 {
+		t.Fatalf("create-vm --spice: code=%d out=%s err=%s", code, out, stderr)
+	}
+	if !strings.Contains(out, "spice=on:") {
+		t.Fatalf("expected spice assignment in output, got: %s", out)
+	}
+	listOut, _, code := runCLI(t, bin, cfg, workdir, "list")
+	if code != 0 {
+		t.Fatalf("list: code=%d", code)
+	}
+	if !strings.Contains(listOut, "on:5930") {
+		t.Fatalf("expected tracked SPICE port in list output, got: %s", listOut)
+	}
+	preview, _, code := runCLI(t, bin, cfg, workdir, "--preview", "run", "v1")
+	if code != 0 {
+		t.Fatalf("preview run: code=%d out=%s", code, preview)
+	}
+	if !strings.Contains(preview, "-spice port=5930") ||
+		!strings.Contains(preview, "virtserialport,chardev=vdagent,name=com.redhat.spice.0") {
+		t.Fatalf("expected SPICE runtime args in preview, got: %s", preview)
+	}
+
+	spiceCmd, _, code := runCLI(t, bin, cfg, workdir, "get-spice", "v1")
+	if code != 0 {
+		t.Fatalf("get-spice: code=%d out=%s", code, spiceCmd)
+	}
+	if strings.TrimSpace(spiceCmd) != "remote-viewer spice://127.0.0.1:5930" {
+		t.Fatalf("unexpected get-spice output: %q", spiceCmd)
+	}
+
+	// Simulate a qemu daemonized run to verify cmdRun prints the SPICE command.
+	fakeQemu := filepath.Join(workdir, "qemu-system-x86_64")
+	if err := os.WriteFile(fakeQemu, []byte("#!/bin/sh\nfor i in \"$@\"; do if [ \"$prev\" = \"-pidfile\" ]; then pidfile=\"$i\"; fi; prev=\"$i\"; done\nif [ -n \"$pidfile\" ]; then echo $$ > \"$pidfile\"; fi\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake qemu: %v", err)
+	}
+	cmd := exec.Command(bin, "--alt-config", cfg, "run", "v1")
+	cmd.Dir = workdir
+	cmd.Env = append(os.Environ(), "PATH="+workdir+":"+os.Getenv("PATH"))
+	var rOut, rErr bytes.Buffer
+	cmd.Stdout = &rOut
+	cmd.Stderr = &rErr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run with fake qemu failed: %v stderr=%s", err, rErr.String())
+	}
+	if !strings.Contains(rOut.String(), "SPICE: remote-viewer spice://127.0.0.1:5930") {
+		t.Fatalf("run output should include SPICE command, got: %s", rOut.String())
+	}
+}
+
 // TestCLIDeleteBaseWithClone verifies deleting a frozen base that has clones is refused.
 func TestCLIDeleteBaseWithClone(t *testing.T) {
 	bin := buildBinary(t)
@@ -353,6 +408,72 @@ func TestCLISetVM(t *testing.T) {
 	_, _, code = runCLI(t, bin, cfg, workdir, "set-vm", "vm1")
 	if code == 0 {
 		t.Fatalf("expected error for set-vm with no params")
+	}
+}
+
+func TestCLIAliases(t *testing.T) {
+	bin := buildBinary(t)
+	workdir := t.TempDir()
+	cfg := filepath.Join(workdir, "config.json")
+	runCLI(t, bin, cfg, workdir, "create-disk", "d", "5G")
+	runCLI(t, bin, cfg, workdir, "create-vm", "v1")
+
+	out, _, code := runCLI(t, bin, cfg, workdir, "ls")
+	if code != 0 {
+		t.Fatalf("ls alias failed: code=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "v1") {
+		t.Fatalf("ls output should include vm name, got: %s", out)
+	}
+
+	full := []string{"--alt-config", cfg, "rm", "v1"}
+	cmd := exec.Command(bin, full...)
+	cmd.Dir = workdir
+	cmd.Stdin = strings.NewReader("y\n")
+	var o2, e2 bytes.Buffer
+	cmd.Stdout = &o2
+	cmd.Stderr = &e2
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("rm alias failed: %v stderr=%s", err, e2.String())
+	}
+	c := load(t, cfg)
+	if _, ok := c.VMs["v1"]; ok {
+		t.Fatalf("vm should be deleted via rm alias")
+	}
+}
+
+func TestCLIDiskAliases(t *testing.T) {
+	bin := buildBinary(t)
+	workdir := t.TempDir()
+	cfg := filepath.Join(workdir, "config.json")
+	runCLI(t, bin, cfg, workdir, "create-disk", "d1", "5G")
+
+	out, _, code := runCLI(t, bin, cfg, workdir, "lsd")
+	if code != 0 {
+		t.Fatalf("lsd alias failed: code=%d out=%s", code, out)
+	}
+	if !strings.Contains(out, "d1") {
+		t.Fatalf("lsd output should include disk name, got: %s", out)
+	}
+
+	// Two confirmations: remove from qmain, then also remove image file.
+	full := []string{"--alt-config", cfg, "rmd", "d1"}
+	cmd := exec.Command(bin, full...)
+	cmd.Dir = workdir
+	cmd.Stdin = strings.NewReader("y\ny\n")
+	var o2, e2 bytes.Buffer
+	cmd.Stdout = &o2
+	cmd.Stderr = &e2
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("rmd alias failed: %v stderr=%s", err, e2.String())
+	}
+
+	c := load(t, cfg)
+	if _, ok := c.Disks["d1"]; ok {
+		t.Fatalf("disk should be removed via rmd alias")
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "d1.qcow2")); !os.IsNotExist(err) {
+		t.Fatalf("disk image should be removed via rmd alias, stat err=%v", err)
 	}
 }
 

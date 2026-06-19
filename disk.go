@@ -142,19 +142,22 @@ func UnfreezeDisk(r Runner, c *Config, name string) (*Disk, error) {
 
 // --- delete-disk ---
 
-// DeleteDisk removes a disk image and its config entry, with VM-dependency and
-// confirmation checks.
-func DeleteDisk(r Runner, c *Config, cf Confirmer, name string) (*Disk, error) {
+// DeleteDisk removes a disk's config entry, with VM-dependency and confirmation
+// checks. It asks twice: first to confirm removing the disk from qmain, then
+// whether the underlying image file should also be deleted from disk (answering
+// no keeps the file and only detaches it). The returned bool reports whether the
+// image file was deleted.
+func DeleteDisk(r Runner, c *Config, cf Confirmer, name string) (*Disk, bool, error) {
 	d, err := getDisk(c, name)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if vms := c.vmsUsingDisk(name); len(vms) > 0 {
 		names := make([]string, len(vms))
 		for i, v := range vms {
 			names[i] = v.Name
 		}
-		return d, fmt.Errorf("cannot delete %q: VMs depend on it: %s",
+		return d, false, fmt.Errorf("cannot delete %q: VMs depend on it: %s",
 			name, joinNames(names))
 	}
 	// A base disk with cloned children would break those clones; refuse.
@@ -163,24 +166,29 @@ func DeleteDisk(r Runner, c *Config, cf Confirmer, name string) (*Disk, error) {
 		for i, cl := range clones {
 			names[i] = cl.Name
 		}
-		return d, fmt.Errorf("cannot delete %q: cloned disks depend on it: %s",
+		return d, false, fmt.Errorf("cannot delete %q: cloned disks depend on it: %s",
 			name, joinNames(names))
 	}
-	if err := requireConfirmation(cf, fmt.Sprintf("Delete disk %q?", name)); err != nil {
-		return d, err
+	if err := requireConfirmation(cf, fmt.Sprintf("Remove disk %q from qmain?", name)); err != nil {
+		return d, false, err
 	}
-	// If frozen, make it writable again before removing the file.
-	if d.Frozen {
-		if err := os.Chmod(d.Path, 0o644); err != nil && !os.IsNotExist(err) {
-			return d, fmt.Errorf("chmod failed: %v", err)
+	// Second question: also delete the image file, or just detach it from qmain?
+	deleteFile := cf.Confirm(fmt.Sprintf(
+		"Also delete the image file %s? (No keeps the file and only detaches it)", d.Path)) == PromptYes
+	if deleteFile {
+		// If frozen, make it writable again before removing the file.
+		if d.Frozen {
+			if err := os.Chmod(d.Path, 0o644); err != nil && !os.IsNotExist(err) {
+				return d, false, fmt.Errorf("chmod failed: %v", err)
+			}
+			d.Frozen = false
 		}
-		d.Frozen = false
-	}
-	if err := os.Remove(d.Path); err != nil && !os.IsNotExist(err) {
-		return d, fmt.Errorf("remove failed: %v", err)
+		if err := os.Remove(d.Path); err != nil && !os.IsNotExist(err) {
+			return d, false, fmt.Errorf("remove failed: %v", err)
+		}
 	}
 	delete(c.Disks, name)
-	return d, nil
+	return d, deleteFile, nil
 }
 
 // --- helpers ---

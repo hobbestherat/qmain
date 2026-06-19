@@ -105,19 +105,25 @@ Global flags (before the command):
 
 Commands:
   create-disk <name> <size>
-  create-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--iso <file>] [-- <extra qemu args>]
+  create-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--spice] [--iso <file>] [-- <extra qemu args>]
   clone-disk <name> --base <base-name>
   freeze-disk <name>
   unfreeze-disk <name>
   delete-disk <name>
-  set-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--iso <file>] [--no-iso] [-- <extra qemu args>]
+  set-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--spice|--no-spice] [--iso <file>] [--no-iso] [-- <extra qemu args>]
   run <vm-name> [--iso <file>] [--display <type>] [--cpus <n>] [-- <extra qemu args>]
   kill <vm-name>
   clear <vm-name>
   get-ssh <vm-name>
   delete <vm-name>
   list
-  list-disks`)
+  list-disks
+
+Aliases:
+  rm <vm-name>         alias for delete
+  ls                   alias for list
+  rmd <disk-name>      alias for delete-disk
+  lsd                  alias for list-disks`)
 }
 
 // Dispatch routes a parsed command (no global flags) to its handler.
@@ -147,7 +153,11 @@ func (a *App) Dispatch(cmd []string) (int, error) {
 		return a.cmdKill(cmd[1:])
 	case "list":
 		return a.cmdList(cmd[1:])
+	case "ls":
+		return a.cmdList(cmd[1:])
 	case "list-disks":
+		return a.cmdListDisks(cmd[1:])
+	case "lsd":
 		return a.cmdListDisks(cmd[1:])
 	case "clear":
 		return a.cmdClear(cmd[1:])
@@ -155,6 +165,10 @@ func (a *App) Dispatch(cmd []string) (int, error) {
 		return a.cmdGetSSH(cmd[1:])
 	case "delete":
 		return a.cmdDelete(cmd[1:])
+	case "rm":
+		return a.cmdDelete(cmd[1:])
+	case "rmd":
+		return a.cmdDeleteDisk(cmd[1:])
 	default:
 		usage()
 		return 2, fmt.Errorf("unknown command %q", cmd[0])
@@ -218,7 +232,7 @@ func (a *App) cmdCreateDisk(args []string) (int, error) {
 
 func (a *App) cmdCreateVM(args []string) (int, error) {
 	if len(args) < 1 {
-		return 2, fmt.Errorf("usage: create-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--iso <file>] [-- <extra qemu args>]")
+		return 2, fmt.Errorf("usage: create-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--spice] [--iso <file>] [-- <extra qemu args>]")
 	}
 	name := args[0]
 	u, err := parseVMUpdate(args[1:])
@@ -253,8 +267,12 @@ func (a *App) cmdCreateVM(args []string) (int, error) {
 			}
 		}
 		port := c.nextSSHPort(baseSSHPort)
-		previewln("would register vm %q (disk=%s ram=%s arch=%s cpus=%s display=%s iso=%s ssh-port=%d)",
-			name, diskName, ram, arch, cpusStr(opts.CPUs), displayStr(opts.Display), isoStr(opts.ISO), port)
+		spice := "off"
+		if opts.Spice {
+			spice = fmt.Sprintf("on:%d", c.nextSPICEPort(baseSPICEPort))
+		}
+		previewln("would register vm %q (disk=%s ram=%s arch=%s cpus=%s display=%s spice=%s iso=%s ssh-port=%d)",
+			name, diskName, ram, arch, cpusStr(opts.CPUs), displayStr(opts.Display), spice, isoStr(opts.ISO), port)
 		return 0, nil
 	}
 	vm, err := CreateVM(a.Runner, c, name, opts)
@@ -264,8 +282,8 @@ func (a *App) cmdCreateVM(args []string) (int, error) {
 	if err := a.commit(c); err != nil {
 		return 1, err
 	}
-	fmt.Printf("Created vm %q (disk=%s ram=%s arch=%s cpus=%s display=%s iso=%s ssh-port=%d)\n",
-		vm.Name, vm.Disk, vm.RAM, vm.Arch, cpusStr(vm.CPUs), displayStr(vm.Display), isoStr(vm.ISO), vm.SSHPort)
+	fmt.Printf("Created vm %q (disk=%s ram=%s arch=%s cpus=%s display=%s spice=%s iso=%s ssh-port=%d)\n",
+		vm.Name, vm.Disk, vm.RAM, vm.Arch, cpusStr(vm.CPUs), displayStr(vm.Display), spiceStr(vm), isoStr(vm.ISO), vm.SSHPort)
 	return 0, nil
 }
 
@@ -273,7 +291,7 @@ func (a *App) cmdCreateVM(args []string) (int, error) {
 
 func (a *App) cmdSetVM(args []string) (int, error) {
 	if len(args) < 1 {
-		return 2, fmt.Errorf("usage: set-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--iso <file>] [--no-iso] [-- <extra qemu args>]")
+		return 2, fmt.Errorf("usage: set-vm <name> [--disk <name>] [--ram <size>] [--cpu <arch>] [--cpus <n>] [--display <type>] [--spice|--no-spice] [--iso <file>] [--no-iso] [-- <extra qemu args>]")
 	}
 	name := args[0]
 	u, err := parseVMUpdate(args[1:])
@@ -297,15 +315,15 @@ func (a *App) cmdSetVM(args []string) (int, error) {
 		return a.previewError(serr)
 	}
 	if a.Preview {
-		previewln("would update vm %q -> (disk=%s ram=%s arch=%s cpus=%s display=%s iso=%s)",
-			name, vm.Disk, vm.RAM, vm.Arch, cpusStr(vm.CPUs), displayStr(vm.Display), isoStr(vm.ISO))
+		previewln("would update vm %q -> (disk=%s ram=%s arch=%s cpus=%s display=%s spice=%s iso=%s)",
+			name, vm.Disk, vm.RAM, vm.Arch, cpusStr(vm.CPUs), displayStr(vm.Display), spiceStr(vm), isoStr(vm.ISO))
 		return 0, nil
 	}
 	if err := a.commit(c); err != nil {
 		return 1, err
 	}
-	fmt.Printf("Updated vm %q (disk=%s ram=%s arch=%s cpus=%s display=%s iso=%s)\n",
-		vm.Name, vm.Disk, vm.RAM, vm.Arch, cpusStr(vm.CPUs), displayStr(vm.Display), isoStr(vm.ISO))
+	fmt.Printf("Updated vm %q (disk=%s ram=%s arch=%s cpus=%s display=%s spice=%s iso=%s)\n",
+		vm.Name, vm.Disk, vm.RAM, vm.Arch, cpusStr(vm.CPUs), displayStr(vm.Display), spiceStr(vm), isoStr(vm.ISO))
 	if vm.PID != 0 && pidIsQemu(vm.PID) {
 		fmt.Println("note: vm is running; changes take effect on next run")
 	}
@@ -439,7 +457,7 @@ func (a *App) cmdDeleteDisk(args []string) (int, error) {
 		return 1, err
 	}
 	if a.Preview {
-		_, gerr := getDisk(c, name)
+		d, gerr := getDisk(c, name)
 		if gerr != nil {
 			fmt.Printf("[preview] error: %v\n", gerr)
 			return 0, nil
@@ -462,18 +480,23 @@ func (a *App) cmdDeleteDisk(args []string) (int, error) {
 				name, joinNames(names))
 			return 0, nil
 		}
-		fmt.Printf("[preview] would ask: Delete disk %q? [y/N]\n", name)
-		fmt.Printf("[preview] would run: rm %s\n", diskPath(name))
+		fmt.Printf("[preview] would ask: Remove disk %q from qmain? [y/N]\n", name)
+		fmt.Printf("[preview] would ask: Also delete the image file %s? [y/N]\n", d.Path)
+		fmt.Printf("[preview] if yes: rm %s\n", d.Path)
 		return 0, nil
 	}
-	d, err := DeleteDisk(a.Runner, c, a.Confirmer, name)
+	d, fileDeleted, err := DeleteDisk(a.Runner, c, a.Confirmer, name)
 	if err != nil {
 		return 1, err
 	}
 	if err := a.commit(c); err != nil {
 		return 1, err
 	}
-	fmt.Printf("Deleted disk %q\n", d.Name)
+	if fileDeleted {
+		fmt.Printf("Deleted disk %q and removed image file %s\n", d.Name, d.Path)
+	} else {
+		fmt.Printf("Detached disk %q from qmain (kept image file %s)\n", d.Name, d.Path)
+	}
 	return 0, nil
 }
 
@@ -536,6 +559,9 @@ func (a *App) cmdRun(args []string) (int, error) {
 		return 1, err
 	}
 	fmt.Printf("Started vm %q (pid %d, ssh: %s)\n", name, pid, sshCmd(vm.SSHPort))
+	if vm.Spice && vm.SpicePort > 0 {
+		fmt.Printf("SPICE: %s\n", spiceViewerCmd(vm.SpicePort))
+	}
 	return 0, nil
 }
 
@@ -686,6 +712,25 @@ func (a *App) cmdGetSSH(args []string) (int, error) {
 	return 0, nil
 }
 
+// --- get-spice ---
+
+func (a *App) cmdGetSpice(args []string) (int, error) {
+	if len(args) < 1 {
+		return 2, fmt.Errorf("usage: get-spice <vm-name>")
+	}
+	name := args[0]
+	c, err := a.load()
+	if err != nil {
+		return 1, err
+	}
+	cmd, err := GetSpice(c, name)
+	if err != nil {
+		return 1, err
+	}
+	fmt.Println(cmd)
+	return 0, nil
+}
+
 // --- delete ---
 
 func (a *App) cmdDelete(args []string) (int, error) {
@@ -733,14 +778,14 @@ func (a *App) cmdList(args []string) (int, error) {
 		fmt.Println("No VMs.")
 		return 0, nil
 	}
-	fmt.Printf("%-16s %-12s %-8s %-10s %-6s %-8s %-8s %-8s\n", "NAME", "DISK", "RAM", "ARCH", "CPUS", "DISPLAY", "SSH", "PID")
+	fmt.Printf("%-16s %-12s %-8s %-10s %-6s %-8s %-10s %-8s %-8s\n", "NAME", "DISK", "RAM", "ARCH", "CPUS", "DISPLAY", "SPICE", "SSH", "PID")
 	for _, v := range c.VMs {
 		pidStr := "-"
 		if v.PID != 0 {
 			pidStr = strconv.Itoa(v.PID)
 		}
-		fmt.Printf("%-16s %-12s %-8s %-10s %-6s %-8s %-8d %-8s\n",
-			v.Name, v.Disk, v.RAM, v.Arch, cpusStr(v.CPUs), displayStr(v.Display), v.SSHPort, pidStr)
+		fmt.Printf("%-16s %-12s %-8s %-10s %-6s %-8s %-10s %-8d %-8s\n",
+			v.Name, v.Disk, v.RAM, v.Arch, cpusStr(v.CPUs), displayStr(v.Display), spiceStr(v), v.SSHPort, pidStr)
 	}
 	return 0, nil
 }
@@ -817,6 +862,14 @@ func parseVMUpdate(args []string) (VMUpdate, error) {
 			empty := ""
 			u.ISO = &empty
 			i++
+		case a == "--spice":
+			enabled := true
+			u.Spice = &enabled
+			i++
+		case a == "--no-spice":
+			enabled := false
+			u.Spice = &enabled
+			i++
 		case matchFlag(a, "--disk"):
 			v, ni, err := flagVal(args, i, "--disk")
 			if err != nil {
@@ -887,6 +940,9 @@ func optionsFromUpdate(u VMUpdate) CreateVMOptions {
 	if u.Display != nil {
 		o.Display = *u.Display
 	}
+	if u.Spice != nil {
+		o.Spice = *u.Spice
+	}
 	if u.ISO != nil {
 		o.ISO = *u.ISO
 	}
@@ -901,6 +957,10 @@ func previewln(format string, args ...interface{}) {
 }
 
 func sshCmd(port int) string { return fmt.Sprintf("ssh -p %d root@127.0.0.1", port) }
+
+func spiceViewerCmd(port int) string {
+	return fmt.Sprintf("remote-viewer spice://127.0.0.1:%d", port)
+}
 
 // cpusStr renders a -smp count for display ("default" when unset).
 func cpusStr(n int) string {
@@ -924,4 +984,12 @@ func isoStr(p string) string {
 		return "-"
 	}
 	return p
+}
+
+// spiceStr renders SPICE state as "on:<port>" or "off".
+func spiceStr(v *VM) string {
+	if v == nil || !v.Spice || v.SpicePort <= 0 {
+		return "off"
+	}
+	return fmt.Sprintf("on:%d", v.SpicePort)
 }

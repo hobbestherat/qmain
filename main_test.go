@@ -45,6 +45,22 @@ type alwaysNoConfirmer struct{}
 
 func (alwaysNoConfirmer) Confirm(q string) PromptResult { return PromptNo }
 
+// scriptConfirmer returns a predetermined sequence of answers, one per call.
+// Once exhausted it returns PromptNo.
+type scriptConfirmer struct {
+	answers []PromptResult
+	i       int
+}
+
+func (s *scriptConfirmer) Confirm(q string) PromptResult {
+	if s.i >= len(s.answers) {
+		return PromptNo
+	}
+	a := s.answers[s.i]
+	s.i++
+	return a
+}
+
 // --- helpers ---
 
 func tempConfig(t *testing.T) string {
@@ -292,7 +308,7 @@ func TestDeleteDiskWithVM(t *testing.T) {
 	c := load(t, cfg)
 	_, _ = CreateDisk(r, c, "d", "10G")
 	_, _ = CreateVM(r, c, "vm1", CreateVMOptions{Disk: "d", RAM: "8G"})
-	if _, err := DeleteDisk(r, c, alwaysYesConfirmer{}, "d"); err == nil {
+	if _, _, err := DeleteDisk(r, c, alwaysYesConfirmer{}, "d"); err == nil {
 		t.Fatalf("expected error deleting disk with VM")
 	}
 }
@@ -307,11 +323,46 @@ func TestDeleteDiskOK(t *testing.T) {
 	if err := os.WriteFile(d.Path, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DeleteDisk(r, c, alwaysYesConfirmer{}, "d"); err != nil {
+	_, fileDeleted, err := DeleteDisk(r, c, alwaysYesConfirmer{}, "d")
+	if err != nil {
 		t.Fatalf("delete: %v", err)
+	}
+	if !fileDeleted {
+		t.Fatalf("expected file deleted when both questions answered yes")
 	}
 	if _, ok := c.Disks["d"]; ok {
 		t.Fatalf("disk should be removed")
+	}
+	if _, err := os.Stat(d.Path); !os.IsNotExist(err) {
+		t.Fatalf("image file should be gone, stat err=%v", err)
+	}
+}
+
+// TestDeleteDiskDetachOnly verifies that answering "yes" to remove-from-qmain
+// but "no" to delete-file detaches the disk while keeping the image file.
+func TestDeleteDiskDetachOnly(t *testing.T) {
+	cfg := tempConfig(t)
+	dir := t.TempDir()
+	setTempCwd(t, dir)
+	r := &fakeRunner{}
+	c := load(t, cfg)
+	d, _ := CreateDisk(r, c, "d", "10G")
+	if err := os.WriteFile(d.Path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// yes (remove from qmain), then no (keep the file).
+	_, fileDeleted, err := DeleteDisk(r, c, &scriptConfirmer{answers: []PromptResult{PromptYes, PromptNo}}, "d")
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if fileDeleted {
+		t.Fatalf("expected file kept when second question declined")
+	}
+	if _, ok := c.Disks["d"]; ok {
+		t.Fatalf("disk should be detached from config")
+	}
+	if _, err := os.Stat(d.Path); err != nil {
+		t.Fatalf("image file should still exist, got: %v", err)
 	}
 }
 
@@ -325,7 +376,7 @@ func TestDeleteDiskDeclined(t *testing.T) {
 	if err := os.WriteFile(d.Path, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DeleteDisk(r, c, alwaysNoConfirmer{}, "d"); err == nil {
+	if _, _, err := DeleteDisk(r, c, alwaysNoConfirmer{}, "d"); err == nil {
 		t.Fatalf("expected error when confirmation declined")
 	}
 	if _, ok := c.Disks["d"]; !ok {
@@ -349,7 +400,7 @@ func TestDeleteDiskBlockedByClone(t *testing.T) {
 		t.Fatal(err)
 	}
 	// base has a clone -> delete must be refused even with confirmation.
-	_, err := DeleteDisk(r, c, alwaysYesConfirmer{}, "base")
+	_, _, err := DeleteDisk(r, c, alwaysYesConfirmer{}, "base")
 	if err == nil {
 		t.Fatalf("expected error deleting base disk with dependent clone")
 	}
@@ -386,6 +437,9 @@ func TestCreateVMDefaults(t *testing.T) {
 	if vm.SSHPort != 2222 {
 		t.Fatalf("expected ssh port 2222, got %d", vm.SSHPort)
 	}
+	if vm.Spice || vm.SpicePort != 0 {
+		t.Fatalf("spice should default off, got spice=%v port=%d", vm.Spice, vm.SpicePort)
+	}
 }
 
 func TestCreateVMNoDisk(t *testing.T) {
@@ -408,6 +462,32 @@ func TestCreateVMCustomPort(t *testing.T) {
 	vm2, _ := CreateVM(r, c, "vm2", CreateVMOptions{})
 	if vm1.SSHPort == vm2.SSHPort {
 		t.Fatalf("expected different ports, got %d and %d", vm1.SSHPort, vm2.SSHPort)
+	}
+}
+
+func TestCreateVMSpicePort(t *testing.T) {
+	cfg := tempConfig(t)
+	dir := t.TempDir()
+	setTempCwd(t, dir)
+	r := &fakeRunner{}
+	c := load(t, cfg)
+	_, _ = CreateDisk(r, c, "disk1", "10G")
+	vm1, err := CreateVM(r, c, "vm1", CreateVMOptions{Spice: true})
+	if err != nil {
+		t.Fatalf("create vm1: %v", err)
+	}
+	vm2, err := CreateVM(r, c, "vm2", CreateVMOptions{Spice: true})
+	if err != nil {
+		t.Fatalf("create vm2: %v", err)
+	}
+	if !vm1.Spice || !vm2.Spice {
+		t.Fatalf("expected spice enabled for both VMs")
+	}
+	if vm1.SpicePort != baseSPICEPort {
+		t.Fatalf("expected first SPICE port %d, got %d", baseSPICEPort, vm1.SpicePort)
+	}
+	if vm2.SpicePort != baseSPICEPort+1 {
+		t.Fatalf("expected second SPICE port %d, got %d", baseSPICEPort+1, vm2.SpicePort)
 	}
 }
 
@@ -451,6 +531,32 @@ func TestSetVMPartialUpdate(t *testing.T) {
 	}
 	if vm.RAM != "8G" {
 		t.Fatalf("RAM should be unchanged, got %q", vm.RAM)
+	}
+}
+
+func TestSetVMSpiceToggle(t *testing.T) {
+	cfg := tempConfig(t)
+	dir := t.TempDir()
+	setTempCwd(t, dir)
+	r := &fakeRunner{}
+	c := load(t, cfg)
+	_, _ = CreateDisk(r, c, "d", "10G")
+	_, _ = CreateVM(r, c, "vm1", CreateVMOptions{Disk: "d"})
+	enabled := true
+	vm, err := SetVM(c, "vm1", VMUpdate{Spice: &enabled})
+	if err != nil {
+		t.Fatalf("enable spice: %v", err)
+	}
+	if !vm.Spice || vm.SpicePort != baseSPICEPort {
+		t.Fatalf("expected spice on:%d, got spice=%v port=%d", baseSPICEPort, vm.Spice, vm.SpicePort)
+	}
+	disabled := false
+	vm, err = SetVM(c, "vm1", VMUpdate{Spice: &disabled})
+	if err != nil {
+		t.Fatalf("disable spice: %v", err)
+	}
+	if vm.Spice || vm.SpicePort != 0 {
+		t.Fatalf("expected spice disabled and port reset, got spice=%v port=%d", vm.Spice, vm.SpicePort)
 	}
 }
 
@@ -636,6 +742,37 @@ func TestGetSSH(t *testing.T) {
 	}
 }
 
+func TestGetSpice(t *testing.T) {
+	cfg := tempConfig(t)
+	dir := t.TempDir()
+	setTempCwd(t, dir)
+	r := &fakeRunner{}
+	c := load(t, cfg)
+	_, _ = CreateDisk(r, c, "d", "10G")
+	vm, _ := CreateVM(r, c, "vm1", CreateVMOptions{Disk: "d", Spice: true})
+	cmd, err := GetSpice(c, "vm1")
+	if err != nil {
+		t.Fatalf("get-spice: %v", err)
+	}
+	want := "remote-viewer spice://127.0.0.1:" + strconv.Itoa(vm.SpicePort)
+	if cmd != want {
+		t.Fatalf("expected %q, got %q", want, cmd)
+	}
+}
+
+func TestGetSpiceDisabled(t *testing.T) {
+	cfg := tempConfig(t)
+	dir := t.TempDir()
+	setTempCwd(t, dir)
+	r := &fakeRunner{}
+	c := load(t, cfg)
+	_, _ = CreateDisk(r, c, "d", "10G")
+	_, _ = CreateVM(r, c, "vm1", CreateVMOptions{Disk: "d"})
+	if _, err := GetSpice(c, "vm1"); err == nil {
+		t.Fatalf("expected error for vm without SPICE")
+	}
+}
+
 func TestDeleteVM(t *testing.T) {
 	cfg := tempConfig(t)
 	dir := t.TempDir()
@@ -671,7 +808,7 @@ func TestDeleteVMDeclined(t *testing.T) {
 // --- flag parsing tests ---
 
 func TestParseVMUpdate(t *testing.T) {
-	u, err := parseVMUpdate([]string{"--cpus", "4", "--display=none", "--iso", "x.iso", "--", "-cpu", "host"})
+	u, err := parseVMUpdate([]string{"--cpus", "4", "--display=none", "--spice", "--iso", "x.iso", "--", "-cpu", "host"})
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -684,12 +821,25 @@ func TestParseVMUpdate(t *testing.T) {
 	if u.ISO == nil || *u.ISO != "x.iso" {
 		t.Fatalf("iso not parsed: %+v", u.ISO)
 	}
+	if u.Spice == nil || !*u.Spice {
+		t.Fatalf("spice not parsed: %+v", u.Spice)
+	}
 	if u.Extra == nil || strings.Join(*u.Extra, " ") != "-cpu host" {
 		t.Fatalf("extra not parsed: %+v", u.Extra)
 	}
 	// Unset flags must remain nil.
 	if u.RAM != nil || u.Disk != nil || u.Arch != nil {
 		t.Fatalf("unset flags should be nil: %+v", u)
+	}
+}
+
+func TestParseVMUpdateNoSpice(t *testing.T) {
+	u, err := parseVMUpdate([]string{"--no-spice"})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if u.Spice == nil || *u.Spice {
+		t.Fatalf("--no-spice should set spice=false pointer, got %+v", u.Spice)
 	}
 }
 
@@ -725,6 +875,33 @@ func TestParseRunFlags(t *testing.T) {
 	}
 	if strings.Join(opts.Extra, " ") != "-snapshot" {
 		t.Fatalf("extra not parsed: %v", opts.Extra)
+	}
+}
+
+// TestKVMAccelDefault verifies x86 VMs get KVM acceleration (with tcg fallback)
+// while other arches do not.
+func TestKVMAccelDefault(t *testing.T) {
+	if got := defaultAccel("x86_64"); got != "kvm:tcg" {
+		t.Fatalf("x86_64 should default to kvm:tcg, got %q", got)
+	}
+	if got := defaultAccel("aarch64"); got != "" {
+		t.Fatalf("non-x86 arch should have no default accel, got %q", got)
+	}
+	x86 := mergeRunOptions(&VM{Arch: "x86_64"}, RunOptions{})
+	if !strings.Contains(strings.Join(qemuArgs("/d.qcow2", "8G", 2222, x86), " "), "-machine accel=kvm:tcg") {
+		t.Fatalf("expected KVM accel in x86 args")
+	}
+	arm := mergeRunOptions(&VM{Arch: "aarch64"}, RunOptions{})
+	if strings.Contains(strings.Join(qemuArgs("/d.qcow2", "8G", 2222, arm), " "), "-machine accel") {
+		t.Fatalf("non-x86 should not get -machine accel")
+	}
+	spice := mergeRunOptions(&VM{Arch: "x86_64", Spice: true, SpicePort: 5935}, RunOptions{})
+	spiceArgs := strings.Join(qemuArgs("/d.qcow2", "8G", 2222, spice), " ")
+	if !strings.Contains(spiceArgs, "-spice port=5935") {
+		t.Fatalf("expected spice port in args, got: %s", spiceArgs)
+	}
+	if !strings.Contains(spiceArgs, "virtserialport,chardev=vdagent,name=com.redhat.spice.0") {
+		t.Fatalf("expected SPICE vdagent channel for clipboard, got: %s", spiceArgs)
 	}
 }
 
